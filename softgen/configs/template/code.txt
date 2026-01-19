@@ -1,0 +1,2072 @@
+package main
+
+
+import (
+"flag"
+"os" "strings"
+package main
+
+"github.com/go-kratos/kratos/v2" "video/internal/biz" "video/internal/conf" "video/internal/data" "video/internal/pkg/monitor" "video/internal/pkg/monitor_storage" "video/internal/pkg/task" "video/internal/server" "video/internal/service"
+)
+
+_ "codeup.aliyun.com/zenwell/go-common.git/plugins/gorm/filter"
+_ "video/internal/pkg/encoding/yml"
+)
+
+// Injectors from wire.go:
+// wireApp init kratos application.
+
+func wireApp(c *conf.Bootstrap) (*kratos.App, func(), error) { universalClient, err := data.NewRedis(c)
+if err != nil {
+return nil, nil, err
+}
+tenant, err := data.NewDB(c) if err != nil {
+return nil, nil, err
+}
+sonyflake, err := data.NewSonyflake(c) if err != nil {
+return nil, nil, err
+}
+minio, err := data.NewMinio(c) if err != nil {
+return nil, nil, err
+}
+tracerProvider, err := data.NewTracer(c) if err != nil {
+return nil, nil, err
+}
+authClient, err := data.NewAuthClient(c) if err != nil {
+return nil, nil, err
+}
+dataData, cleanup := data.NewData(universalClient, tenant, sonyflake, minio, tracerProvider, authClient)
+rtspStorageRepo := data.NewRtspStorageRepo(dataData, minio) monitorStorage := monitorstorage.NewMonitorStorage() videoRepo := data.NewVideoRepo(dataData)
+
+transaction := data.NewTransaction(dataData) cache := data.NewCache(universalClient)
+handleLogRepo := data.NewHandleLogRepo(dataData)
+handleLogUseCase	:=	biz.NewHandleLogUseCase(c,	handleLogRepo, transaction, cache)
+videoUseCase := biz.NewVideoUseCase(c, videoRepo, transaction, cache, handleLogUseCase)
+cameraRepo := data.NewCameraRepo(dataData) cameraAlarmLogRepo := data.NewCameraAlarmLogRepo(dataData)
+cameraAlarmLogUseCase := biz.NewCameraAlarmLogUseCase(c, cameraAlarmLogRepo, transaction, cache)
+rtspStorageUseCase	:=	biz.NewRtspSteamStorageUseCase(c, rtspStorageRepo,	monitorStorage,		videoUseCase,	cameraRepo, cameraAlarmLogUseCase, minio)
+taskTask, err := task.New(c, rtspStorageUseCase) if err != nil {
+cleanup()
+return nil, nil, err
+
+
+
+cache)
+
+}
+rtspRepo := data.NewRtspRepo(dataData) monitorMonitor := monitor.New()
+rtspUseCase := biz.NewRtspUseCase(c, rtspRepo, monitorMonitor, transaction,
+
+
+cameraUseCase :=	biz.NewCameraUseCase(c, cameraRepo, transaction,
+
+cache, handleLogUseCase, monitorStorage, rtspStorageUseCase) commonRepo := data.NewCommonRepo(dataData)
+commonUseCase := biz.NewCommonUseCase(c, commonRepo, transaction, cache, cameraRepo, rtspStorageUseCase)
+videoService	:=	service.NewVideoService(taskTask,	videoUseCase, rtspUseCase,	cameraUseCase,	commonUseCase,	rtspStorageUseCase,
+
+func (c *RtspStorageUseCase) serveStreams(ctx context.Context, streamsData []*model.Camera) {
+
+for _, stream := range streamsData {
+go c.HandleRTSPWorker(ctx, stream)
+// 平滑启动
+time.Sleep(1 * time.Second)
+}
+}
+
+func (c *RtspStorageUseCase) HandleRTSPWorker(ctx context.Context, camera
+*model.Camera) {
+err := c.RTSPWorkerLoopV2(ctx, camera) if err != nil {
+c.recordAlarm(ctx, camera.ID, err)
+}
+}
+
+
+func (c *RtspStorageUseCase) RTSPWorkerLoopV2(ctx context.Context, camera
+*model.Camera) (err error) {
+rootPath := c.c.Data.MonitorStorage.SavePath noVideoTimeout := c.c.Data.MonitorStorage.NoVideoTimeout
+noVideoTimeoutFormat := time.Duration(noVideoTimeout) * time.Second name := fmt.Sprintf("% d", camera.ID)
+
+stream,	err	:=	c.monitorStorage.AddStream(camera.IP,	name, monitorstorage.MSE)
+if err != nil {
+return ErrorInitClientErr
+}
+var tempPacket *av.Packet
+var tempDuration time.Duration for {
+
+currentClient := stream.RTSPClient codecs := stream.CodecData
+if len(codecs) == 0 {
+return ErrorStreamNoCodec
+}
+nowTime := carbon.Now()
+date := nowTime.ToDateString() videoInfo := CreateVideo{} videoInfo.CameraId = int64(camera.ID) videoInfo.FileType = FileTypeMp4 fileName := nowTime.Format("H_i_s")
+videoInfo.StartDate = carbon.Now().ToStdTime()
+
+
+f := minioobj.NewMinIOObject(c.minio) muxer := mp4.NewMuxer(f)
+err = muxer.WriteHeader(codecs) if err != nil {
+return err
+}
+var loop = true
+noVideo := time.NewTimer(noVideoTimeoutFormat)
+dur, err := time.ParseDuration(c.c.Data.MonitorStorage.Duration) saveLimit := time.NewTimer(dur)
+checkLimit := false for loop {
+select {
+case <-stream.StopSignal:
+return ErrorVideoStopByDeleted
+case reconnectIp := <-stream.UpdateSignal: loop = false
+
+
+
+name)
+
+stream, err = c.monitorStorage.ReconnectStream(reconnectIp,
+
+
+if err != nil {
+return err
+
+}
+case <-noVideo.C: loop = false
+stream, err = c.reconnectTry(ctx, camera, name) if err != nil {
+return err
+}
+case <-saveLimit.C: checkLimit = true saveLimit.Stop()
+case packetAV := <-currentClient.OutgoingPacketQueue: if tempPacket != nil {
+if err = muxer.WritePacket(*tempPacket); err != nil { return err
+}
+dur += tempDuration tempPacket = nil
+}
+if checkLimit {
+if packetAV.IsKeyFrame { tempPacket = packetAV
+tempDuration = packetAV.Duration loop = false
+continue
+}
+dur += packetAV.Duration
+
+}
+if packetAV.IsKeyFrame { noVideo.Reset(noVideoTimeoutFormat)
+}
+if err = muxer.WritePacket(*packetAV); err != nil { return err
+}
+}
+}
+
+
+
+
+
+
+fileName)
+
+fileName += "-" + nowTime.AddDuration(dur.String()).Format("H_i_s") filePath	:=	fmt.Sprintf("% s/% s/% s/% s.mp4",	rootPath,	name,	date,
+
+videoInfo.EndDate = nowTime.AddDuration(dur.String()).ToStdTime() fileNameURL := fmt.Sprintf("% s-% s.mp4", date, fileName) videoInfo.FileName = &fileNameURL
+videoInfo.FileRealURL = &filePath videoInfo.FileSize = uint64(f.CurrentPosition) err = muxer.WriteTrailer()
+if err != nil {
+return err
+
+}
+go func() {
+subContext := context.Background() c.StreamStorage(subContext, &videoInfo) f.ObjectName = filePath
+err = f.Close() if err != nil {
+log.Info(err)
+// 保存到本地
+err := f.LocalStorage()
+
+
+
+
+
+
+
+err != nil {
+
+if err != nil {
+log.Info(err)
+if err := c.UpdateStatus(ctx, camera.ID, ERROR, NORMAL);
+
+
+log.Info(err)
+}
+
+}
+}
+}()
+}
+}
+
+
+func	(c	*RtspStorageUseCase)	reconnectTry(ctx	context.Context,	camera
+*model.Camera, name string) (*monitorstorage.Stream, error) {
+if err := c.UpdateStatus(ctx, camera.ID, ERROR, NORMAL); err != nil { return nil, err
+}
+// try to reconnect 15s tryTime := 15
+for tryTime > 0 {
+stream, err := c.monitorStorage.ReconnectStream(camera.IP, name) if err != nil {
+time.Sleep(1) tryTime-- continue
+}
+err = c.UpdateStatus(ctx, camera.ID, NORMAL, NORMAL) if err != nil {
+return nil, err
+}
+
+return stream, nil
+}
+c.monitorStorage.DeleteStream(name) return nil, ErrorNoVideoErr
+}
+
+
+func	(c	*RtspStorageUseCase)	StreamStorage(ctx	context.Context,	video
+*CreateVideo) {
+err := c.RecordCameraVideo(ctx, video) if err != nil {
+err := errors.Wrap(ErrorStreamStorageRecordErr, err.Error()) c.recordAlarm(ctx, uint64(video.CameraId), err)
+return
+}
+err = c.UpdateStatus(ctx, uint64(video.CameraId), NORMAL, NORMAL) if err != nil {
+c.recordAlarm(ctx, uint64(video.CameraId), err)
+}
+}
+
+
+func (c *RtspStorageUseCase) RecordCameraVideo(subContext context.Context, videoData *CreateVideo) (err error) {
+uuNo := uuid.NewString()
+videoNo := fmt.Sprintf("% d_% s", videoData.CameraId, uuNo) videoData.VideoNo = &videoNo
+
+err = c.videoUseCase.Create(subContext, videoData) if err != nil {
+return
+}
+
+return nil
+}
+
+
+type AlarmLogType uint32
+
+
+const (
+NoVideo = iota + 1 InitErr
+NoCodec ConfigErr SaveErr RecordErr CompressErr CameraDeleted
+)
+
+
+func (a AlarmLogType) String() string { switch a {
+case NoVideo:
+return "视频流缺失" case InitErr:
+return "网络中断" case NoCodec:
+return "编码错误" case ConfigErr:
+return "配置错误" case SaveErr:
+return "保存错误" case RecordErr:
+return "保存记录错误"
+
+case CompressErr: return "压缩错误"
+case CameraDeleted:
+return "视频删除"
+}
+return "unknown"
+}
+
+
+func (c *RtspStorageUseCase) recordAlarm(ctx context.Context, cameraID uint64, err error) {
+var logType uint32
+if errors.Is(err, ErrorInitClientErr) { logType = InitErr
+} else if errors.Is(err, ErrorStreamNoCodec) { logType = NoCodec
+} else if errors.Is(err, ErrorInitConfigErr) { logType = ConfigErr
+} else if errors.Is(err, ErrorStreamSaveErr) { logType = SaveErr
+} else if errors.Is(err, ErrorStreamStorageRecordErr) { logType = RecordErr
+} else if errors.Is(err, ErrorVideoCompressErr) { logType = CompressErr
+} else if errors.Is(err, ErrorVideoStopByDeleted) { logType = CameraDeleted
+} else if errors.Is(err, ErrorNoVideoErr) { logType = NoVideo
+} else {
+logType = 0 log.Error(err)
+
+if err := c.UpdateStatus(ctx, cameraID, ERROR, ERROR); err != nil { log.Error(err)
+return
+}
+}
+if logType > 0 {
+// 记录错误日志
+cameraAlarmLog := &CreateCameraAlarmLog{ Type:	logType,
+CameraId: cameraID, Content:	err.Error(),
+}
+err := c.cameraAlarmLog.Create(ctx, cameraAlarmLog) if err != nil {
+log.Error(err) return
+}
+}
+return
+}
+
+
+func (c *RtspStorageUseCase) UpdateStatus(ctx context.Context, cameraId uint64, netStatus int32, status int32) error {
+camera := &UpdateCamera{ Id:	cameraId, NetStatus: &netStatus, Status:	 &status,
+}
+// update camera status
+err := c.cameraRepo.Update(ctx, camera)
+
+if err != nil {
+return err
+}
+return nil
+}
+package biz
+
+
+import (
+"context" "encoding/json" "strconv" "strings"
+"time"
+
+
+"codeup.aliyun.com/zenwell/go-common.git/constant" "codeup.aliyun.com/zenwell/go-common.git/copierx" "codeup.aliyun.com/zenwell/go-common.git/jwt" "codeup.aliyun.com/zenwell/go-common.git/log" "codeup.aliyun.com/zenwell/go-common.git/middleware/i18n" "codeup.aliyun.com/zenwell/go-common.git/page" "codeup.aliyun.com/zenwell/go-common.git/utils" "github.com/dustin/go-humanize"
+"github.com/pkg/errors" "video/api/reason" "video/internal/conf"
+)
+
+
+type Video struct {
+Id	uint64 `json:"id,string"`
+VideoNo	string `json:"videoNo"`
+
+FileName				string `json:"fileName"` FileSize	uint64 `json:"fileSize,string"` FileType		 uint32 `json:"fileType"` FileRealURL			string `json:"fileRealUrl"` CameraId					 int64	`json:"cameraId,string"` StartDate		string `json:"startDate"` EndDate					string `json:"endDate"`
+CreatedAt	string `json:"createdAt,omitempty"` UpdatedAt		string `json:"updatedAt,omitempty"` FileSizeFormat string `json:"fileSizeFormat,omitempty"` FileTypeFormat string `json:"fileTypeFormat,omitempty"`
+}
+
+
+type FindVideo struct {
+Page	 page.Page `json:"page"` VideoNo	 *string		 `json:"videoNo"` FileName	*string		`json:"fileName"` CameraId		 *int64				`json:"cameraId"` StartDate *string	`json:"startDate"` EndDate		*string			`json:"endDate"`
+}
+
+
+type FindVideoCache struct { Page page.Page `json:"page"` List []Video	`json:"list"`
+}
+
+
+type CreateVideo struct {
+CameraId	 int64		`json:"cameraId,omitempty"` VideoNo	*string	`json:"videoNo,omitempty"`
+
+
+FileName	*string	`json:"fileName,omitempty"`
+FileSize	uint64	`json:"fileSize,string,omitempty"`
+FileType	uint32	`json:"fileType,omitempty"`
+FileRealURL *string `json:"fileRealUrl,omitempty"` StartDate time.Time `json:"startDate,omitempty"` EndDate   time.Time `json:"endDate,omitempty"`
+}
+
+
+type UpdateVideo struct {
+Id	uint64	`json:"id,string"`
+VideoNo			 *string `json:"videoNo,omitempty"` FileName			*string `json:"fileName,omitempty"` FileSize	*uint64 `json:"fileSize,string,omitempty"` FileType		*uint32 `json:"fileType,omitempty"` FileRealURL *string `json:"fileRealUrl,omitempty"`
+}
+
+
+type VideoRepo interface {
+Create(ctx context.Context, item *CreateVideo) error Get(ctx context.Context, id uint64) (*Video, error) Find(ctx context.Context, condition *FindVideo) []Video Update(ctx context.Context, item *UpdateVideo) error Delete(ctx context.Context, ids ...uint64) error
+GetPreviewURL(ctx context.Context, id uint64) (string, error) UpdateByKey(ctx context.Context, item *UpdateVideo) error
+}
+
+
+type VideoUseCase struct {
+c	*conf.Bootstrap
+repo	VideoRepo
+
+tx	Transaction
+cache	Cache
+handleLogUseCase *HandleLogUseCase
+}
+
+
+func NewVideoUseCase(c *conf.Bootstrap, repo VideoRepo, tx Transaction, cache Cache, handleLogUseCase *HandleLogUseCase) *VideoUseCase {
+return &VideoUseCase{ c:	c,
+repo: repo, tx:	tx,
+cache: cache.WithPrefix(strings.Join([]string{ c.Name, "video",
+}, "_")),
+handleLogUseCase: handleLogUseCase,
+}
+}
+
+
+func (uc *VideoUseCase) Create(ctx context.Context, item *CreateVideo) error { return uc.tx.Tx(ctx, func(ctx context.Context) error {
+return uc.cache.Flush(ctx, func(ctx context.Context) error { return uc.repo.Create(ctx, item)
+})
+})
+}
+
+
+func (uc *VideoUseCase) Get(ctx context.Context, id uint64) (rp *Video, err error) { rp = &Video{}
+action := strings.Join([]string{"get", strconv.FormatUint(id, 10)}, "_")
+str, ok := uc.cache.Get(ctx, action, func(ctx context.Context) (string, bool) {
+
+return uc.get(ctx, action, id)
+})
+if ok {
+utils.Json2Struct(&rp, str) if rp.Id == constant.UI0 {
+err	=	reason.ErrorNotFound("% s	Video.id:	% d", i18n.FromContext(ctx).T(RecordNotFound), id)
+}
+return
+}
+err	=
+reason.ErrorTooManyRequests(i18n.FromContext(ctx).T(TooManyRequests)) return
+}
+
+
+func (uc *VideoUseCase) get(ctx context.Context, action string, id uint64) (res string, ok bool) {
+// read data from db and write to cache rp := &Video{}
+item, err := uc.repo.Get(ctx, id)
+notFound	:=	errors.Is(err, reason.ErrorNotFound(i18n.FromContext(ctx).T(RecordNotFound)))
+if err != nil && !notFound { return
+}
+copierx.Copy(&rp, item) res = utils.Struct2Json(rp)
+uc.cache.Set(ctx, action, res, notFound) ok = true
+return
+
+}
+
+
+func (uc *VideoUseCase) Find(ctx context.Context, condition *FindVideo) (rp []Video)
+{
+// use md5 string as cache replay json str, key is short
+action := strings.Join([]string{"find", utils.StructMd5(condition)}, "_")
+str, ok := uc.cache.Get(ctx, action, func(ctx context.Context) (string, bool) { return uc.find(ctx, action, condition)
+})
+if ok {
+var cache FindVideoCache utils.Json2Struct(&cache, str) condition.Page = cache.Page rp = cache.List
+}
+for i, video := range rp {
+rp[i].FileSizeFormat = humanize.Bytes(video.FileSize) rp[i].FileTypeFormat = fileType(video.FileType).String()
+}
+return
+}
+
+
+type fileType int32
+
+
+const (
+FileTypeMp4 = iota + 1
+)
+
+
+func (m fileType) String() string { switch m {
+
+case FileTypeMp4: return "mp4"
+}
+return "unknown"
+}
+
+
+func (uc *VideoUseCase) find(ctx	context.Context,  action	string, condition
+*FindVideo) (res string, ok bool) {
+// read data from db and write to cache list := uc.repo.Find(ctx, condition)
+var cache FindVideoCache cache.List = list
+cache.Page = condition.Page res = utils.Struct2Json(cache)
+uc.cache.Set(ctx, action, res, len(list) == 0) ok = true
+return
+}
+
+
+func (uc *VideoUseCase) Update(ctx context.Context, item *UpdateVideo) error { return uc.tx.Tx(ctx, func(ctx context.Context) error {
+return uc.cache.Flush(ctx, func(ctx context.Context) (err error) { err = uc.repo.Update(ctx, item)
+return
+})
+})
+}
+
+
+func (uc *VideoUseCase) Delete(ctx context.Context, ids ...uint64) error { return uc.tx.Tx(ctx, func(ctx context.Context) error {
+
+return uc.cache.Flush(ctx, func(ctx context.Context) (err error) { var videos []*Video
+for _, id := range ids {
+video, err := uc.Get(ctx, id) if err != nil {
+return err
+}
+videos = append(videos, video)
+}
+err = uc.repo.Delete(ctx, ids...) if err != nil {
+return err
+}
+go func() {
+// get auth info
+user := jwt.FromServerContext(ctx) contentLog, err := json.Marshal(videos) if err != nil {
+log.Error(err)
+}
+content := string(contentLog) logInfo := &CreateHandleLog{
+Name:	"删除视频",
+Type:		LogTypeDelete, UserId:	user.Code, Content: content,
+}
+subCtx := context.Background()
+err = uc.handleLogUseCase.Create(subCtx, logInfo) if err != nil {
+
+log.Error(err)
+}
+}()
+return
+})
+})
+}
+
+
+func (uc *VideoUseCase) GetPreviewURL(ctx context.Context, id uint64) (rp string, err error) {
+rp, err = uc.repo.GetPreviewURL(ctx, id) return
+}
+
+
+func (uc *VideoUseCase) UpdateByKey(ctx context.Context, item *UpdateVideo) error {
+return uc.repo.UpdateByKey(ctx, item)
+}
+package biz
+
+
+import (
+"context" "encoding/json" "fmt"
+"os" "strconv" "strings"
+
+"codeup.aliyun.com/zenwell/go-common.git/constant" "codeup.aliyun.com/zenwell/go-common.git/copierx"
+
+"codeup.aliyun.com/zenwell/go-common.git/jwt" "codeup.aliyun.com/zenwell/go-common.git/log" "codeup.aliyun.com/zenwell/go-common.git/middleware/i18n" "codeup.aliyun.com/zenwell/go-common.git/page" "codeup.aliyun.com/zenwell/go-common.git/utils" "github.com/golang-module/carbon/v2" "github.com/pkg/errors"
+"github.com/xuri/excelize/v2" "video/api/reason" "video/api/video" "video/internal/conf" "video/internal/data/model"
+monitorstorage "video/internal/pkg/monitor_storage"
+)
+
+
+type Camera struct {
+Id	uint64 `json:"id,string"`
+No	string `json:"no"`
+Ip		string `json:"ip"` Position	string `json:"position"` Status		 *int32 `json:"status"` NetStatus *int32 `json:"netStatus"`
+CreatedAt string `json:"createdAt,string"` UpdatedAt string `json:"updatedAt,string"`
+}
+
+
+type FindCamera struct {
+Page		page.Page `json:"page"` Ip	*string	`json:"ip"` Status	 *int32		`json:"status"`
+
+NetStatus *int32		`json:"netStatus"` Position	*string	`json:"position"` No		*string			`json:"no"`
+}
+type FindCameraCache struct { Page page.Page `json:"page"` List []Camera	`json:"list"`
+}
+
+
+type CreateCamera struct {
+Id	uint64 `json:"id,string"`
+Ip		string `json:"ip,omitempty"` Position	string `json:"position,omitempty"` Status		 uint32 `json:"status,omitempty"` NetStatus uint32 `json:"netStatus,omitempty"` No			string `json:"no,omitempty"`
+}
+
+
+type UpdateCamera struct {
+Id	uint64	`json:"id,string"`
+IP	 *string `json:"ip,omitempty"` UserID		*int32		`json:"userID,omitempty"` Status	*int32	`json:"status,omitempty"`
+NetStatus *int32	`json:"netStatus,omitempty"` No		*string `json:"no,omitempty"` Position	*string `json:"position,omitempty"`
+}
+
+func (uc *CameraUseCase) Get(ctx context.Context, id uint64) (rp *Camera, err error)
+{
+rp = &Camera{}
+action := strings.Join([]string{"get", strconv.FormatUint(id, 10)}, "_")
+str, ok := uc.cache.Get(ctx, action, func(ctx context.Context) (string, bool) { return uc.get(ctx, action, id)
+})
+if ok {
+
+utils.Json2Struct(&rp, str) if rp.Id == constant.UI0 {
+err	=	reason.ErrorNotFound("% s	Camera.id:	% d", i18n.FromContext(ctx).T(RecordNotFound), id)
+}
+return
+}
+err	=
+reason.ErrorTooManyRequests(i18n.FromContext(ctx).T(TooManyRequests)) return
+}
+
+
+func (uc *CameraUseCase) GetByFields(ctx context.Context, no string) (rp *Camera, err error) {
+rp = &Camera{}
+action := strings.Join([]string{"get", no}, "_")
+str, ok := uc.cache.Get(ctx, action, func(ctx context.Context) (string, bool) { return uc.getByFields(ctx, action, no)
+})
+if ok {
+utils.Json2Struct(&rp, str) if rp.Id == constant.UI0 {
+err	=	reason.ErrorNotFound("% s	Camera.id:	% s", i18n.FromContext(ctx).T(RecordNotFound), no)
+}
+return
+}
+err	=
+reason.ErrorTooManyRequests(i18n.FromContext(ctx).T(TooManyRequests)) return
+
+}
+
+
+func (uc *CameraUseCase) getByFields(ctx context.Context, action string, no string) (res string, ok bool) {
+// read data from db and write to cache rp := &Camera{}
+item, err := uc.repo.GetByFields(ctx, no)
+notFound	:=	errors.Is(err, reason.ErrorNotFound(i18n.FromContext(ctx).T(RecordNotFound)))
+if err != nil && !notFound { return
+}
+
+
+copierx.Copy(&rp, item) res = utils.Struct2Json(rp)
+uc.cache.Set(ctx, action, res, notFound) ok = true
+return
+}
+
+
+func (uc *CameraUseCase) get(ctx context.Context, action string, id uint64) (res string, ok bool) {
+// read data from db and write to cache rp := &Camera{}
+item, err := uc.repo.Get(ctx, id)
+notFound	:=	errors.Is(err, reason.ErrorNotFound(i18n.FromContext(ctx).T(RecordNotFound)))
+if err != nil && !notFound { return
+}
+
+
+
+copierx.Copy(&rp, item) res = utils.Struct2Json(rp)
+uc.cache.Set(ctx, action, res, notFound) ok = true
+return
+}
+
+
+func (uc *CameraUseCase) Find(ctx context.Context, condition *FindCamera) (rp []Camera) {
+// use md5 string as cache replay json str, key is short
+action := strings.Join([]string{"find", utils.StructMd5(condition)}, "_")
+str, ok := uc.cache.Get(ctx, action, func(ctx context.Context) (string, bool) { return uc.find(ctx, action, condition)
+})
+if ok {
+var cache FindCameraCache utils.Json2Struct(&cache, str) condition.Page = cache.Page rp = cache.List
+}
+return
+}
+
+
+func (uc *CameraUseCase) find(ctx context.Context, action string, condition
+*FindCamera) (res string, ok bool) {
+// read data from db and write to cache list := uc.repo.Find(ctx, condition)
+var cache FindCameraCache cache.List = list
+
+cache.Page = condition.Page res = utils.Struct2Json(cache)
+uc.cache.Set(ctx, action, res, len(list) == 0) ok = true
+return
+}
+
+
+func (uc *CameraUseCase) Update(ctx context.Context, item *UpdateCamera) error
+{
+return uc.tx.Tx(ctx, func(ctx context.Context) error {
+return uc.cache.Flush(ctx, func(ctx context.Context) (err error) { err = uc.repo.Update(ctx, item)
+if err != nil {
+return err
+}
+go func() {
+// get auth info
+user := jwt.FromServerContext(ctx) contentLog, err := json.Marshal(item) if err != nil {
+log.Error(err)
+}
+content := string(contentLog) logInfo := &CreateHandleLog{
+Name:	"修改摄像头",
+Type:		LogTypeEdit, UserId:	user.Code, Content: content,
+}
+subCtx := context.Background()
+
+err = uc.handleLogUseCase.Create(subCtx, logInfo) if err != nil {
+log.Error(err)
+}
+}()
+go func() {
+name := fmt.Sprintf("% d", item.Id)
+check := uc.monitorStorage.CheckStream(name) if check {
+uc.monitorStorage.UpdateStream(name)
+} else {
+subWorkerCtx := context.Background() camera := model.Camera{}
+err = copierx.Copy(&camera, item) if err != nil {
+log.Info(err)
+
+
+
+
+
+
+&camera)
+
+
+
+
+
+
+
+}
+}()
+
+}
+uc.rtspStorageUseCase.HandleRTSPWorker(subWorkerCtx,
+
+return
+})
+})
+}
+
+
+func (uc *CameraUseCase) Delete(ctx context.Context, ids ...uint64) error { return uc.tx.Tx(ctx, func(ctx context.Context) error {
+return uc.cache.Flush(ctx, func(ctx context.Context) (err error) { var cameras []*Camera
+
+for _, id := range ids {
+camera, err := uc.Get(ctx, id) if err != nil {
+return err
+}
+cameras = append(cameras, camera)
+}
+err = uc.repo.Delete(ctx, ids...) if err != nil {
+return err
+}
+go func() {
+subCtx := context.Background()
+// get auth info
+user := jwt.FromServerContext(ctx) contentLog, err := json.Marshal(cameras) if err != nil {
+log.Error(err)
+}
+content := string(contentLog) logInfo := &CreateHandleLog{
+Name:	"删除摄像头",
+Type:		LogTypeDelete, UserId:	user.Code, Content: content,
+}
+err = uc.handleLogUseCase.Create(subCtx, logInfo) if err != nil {
+log.Error(err)
+}
+
+}()
+go func() {
+for _, id := range ids {
+name := fmt.Sprintf("% d", id) uc.monitorStorage.RemoveStream(name)
+}
+}()
+return
+})
+})
+}
+
+
+type CameraStatus int32 type CameraNetStatus int32
+
+const (
+NORMAL = iota + 1 ERROR
+)
+
+
+func (m CameraStatus) String() string { switch m {
+case NORMAL: return "运行中"
+case ERROR:
+return "设备故障"
+}
+return "unknown"
+}
+
+func (m CameraNetStatus) String() string { switch m {
+case NORMAL: return "已联网"
+case ERROR:
+return "网络中断"
+}
+return "unknown"
+}
+
+
+func	(uc	*CameraUseCase)	ExportAll(ctx	context.Context,	request
+*video.ExportCameraRequest) (string, error) { cameraData, _ := uc.repo.All(ctx, &FindCamera{
+Status: request.Status,
+})
+// 新建一个工作簿
+f := excelize.NewFile()
+
+
+// 新建一个工作表
+sheetName := "Sheet1" f.NewSheet(sheetName)
+
+// 写入表头
+title := []string{"编号", "IP", "位置", "状态", "网络状态", "创建时间"} f.SetSheetRow(sheetName, "A1", &title)
+// 写入数据
+for i, row := range cameraData { rowID := i + 2
+rowAddr, _ := excelize.CoordinatesToCellName(1, rowID) rowTemp := make([]interface{}, 0)
+
+rowTemp = append(rowTemp, row.No) rowTemp = append(rowTemp, row.IP) rowTemp = append(rowTemp, row.Position)
+rowTemp = append(rowTemp, CameraStatus(row.Status).String()) rowTemp = append(rowTemp, CameraNetStatus(row.NetStatus).String()) rowTemp = append(rowTemp, row.CreatedAt) f.SetSheetRow(sheetName, rowAddr, &rowTemp)
+}
+dateStr := carbon.Now().ToDateString()
+fileName := fmt.Sprintf("摄像头导出-% v.xlsx", dateStr)
+
+
+fileRoot := "/tmp/" + dateStr + "/" err := os.MkdirAll(fileRoot, 0755) if err != nil {
+return "", err
+}
+filePath := fileRoot + fileName
+// 保存文件
+err = f.SaveAs(filePath) if err != nil {
+return "", err
+}
+url, err := uc.repo.GetMinoURL(ctx, filePath) if err != nil {
+return "", err
+}
+return url, nil
+}
+
+
+func (uc *CameraUseCase) FlushAll(ctx context.Context) error {
+
+return uc.cache.Flush(ctx, func(ctx context.Context) (err error) { return
+})
+}
+package biz
+
+
+import (
+"context" "strconv" "strings"
+
+"codeup.aliyun.com/zenwell/go-common.git/constant" "codeup.aliyun.com/zenwell/go-common.git/copierx" "codeup.aliyun.com/zenwell/go-common.git/middleware/i18n" "codeup.aliyun.com/zenwell/go-common.git/page" "codeup.aliyun.com/zenwell/go-common.git/utils" "github.com/pkg/errors"
+"video/api/reason" "video/internal/conf"
+)
+
+
+type CameraAlarmLog struct {
+Id	uint64	`json:"id,string"`
+Name	string	`json:"name"`
+Type	 uint32		`json:"type"` TypeFormat string	 `json:"typeFormat"` CameraId		uint64			`json:"cameraId,string"` Content	string	`json:"content"`
+Camera	*Camera `json:"camera"`
+CreatedAt	string	`json:"createdAt,omitempty"`
+
+UpdatedAt	string	`json:"updatedAt,omitempty"`
+}
+
+
+type FindCameraAlarmLog struct {
+Page	 page.Page `json:"page"` CameraId		 *int64			 `json:"cameraId"` Type	int32			`json:"type"` StartDate *string	`json:"startDate"` EndDate		*string		`json:"endDate"`
+}
+
+
+type FindCameraAlarmLogCache struct { Page page.Page	`json:"page"` List []CameraAlarmLog `json:"list"`
+}
+
+
+type UpdateCameraAlarmLog struct { Id	uint64	`json:"id,string"`
+Name *string `json:"name,omitempty"`
+}
+
+
+type LogType struct {
+Key	uint32 `json:"id,string"` Name string `json:"name"`
+}
+
+
+type CreateCameraAlarmLog struct { Id	uint64 `json:"id,string"`
+Name	string `json:"name"`
+Type	uint32 `json:"type"`
+
+TypeFormat string `json:"typeFormat"` CameraId		uint64 `json:"cameraId,string"` Content	string `json:"content"`
+}
+
+
+type CameraAlarmLogRepo interface {
+Create(ctx context.Context, item *CreateCameraAlarmLog) error Get(ctx context.Context, id uint64) (*CameraAlarmLog, error)
+Find(ctx context.Context, condition *FindCameraAlarmLog) []CameraAlarmLog Update(ctx context.Context, item *UpdateCameraAlarmLog) error
+Delete(ctx context.Context, ids ...uint64) error
+}
+
+
+type CameraAlarmLogUseCase struct {
+
+	c	*conf.Bootstrap
+	repo	CameraAlarmLogRepo
+	tx	Transaction
+	cache	Cache
+}
+
+
+func NewCameraAlarmLogUseCase(c *conf.Bootstrap, repo CameraAlarmLogRepo, tx Transaction, cache Cache) *CameraAlarmLogUseCase {
+return &CameraAlarmLogUseCase{ c:	c,
+repo: repo, tx:	tx,
+cache: cache.WithPrefix(strings.Join([]string{ c.Name, "camera_alarm_log",
+}, "_")),
+}
+
+}
+
+
+func	(uc	*CameraAlarmLogUseCase)	Create(ctx	context.Context,	item
+*CreateCameraAlarmLog) error {
+return uc.tx.Tx(ctx, func(ctx context.Context) error {
+return uc.cache.Flush(ctx, func(ctx context.Context) error { return uc.repo.Create(ctx, item)
+})
+})
+}
+
+
+func (uc *CameraAlarmLogUseCase) Get(ctx context.Context, id uint64) (rp
+*CameraAlarmLog, err error) {
+rp = &CameraAlarmLog{}
+action := strings.Join([]string{"get", strconv.FormatUint(id, 10)}, "_")
+str, ok := uc.cache.Get(ctx, action, func(ctx context.Context) (string, bool) { return uc.get(ctx, action, id)
+})
+if ok {
+utils.Json2Struct(&rp, str) if rp.Id == constant.UI0 {
+err	=	reason.ErrorNotFound("% s	CameraAlarmLog.id:	% d", i18n.FromContext(ctx).T(RecordNotFound), id)
+}
+rp.TypeFormat = AlarmLogType(rp.Type).String() return
+}
+err	=
+reason.ErrorTooManyRequests(i18n.FromContext(ctx).T(TooManyRequests)) return
+
+}
+
+
+func (uc *CameraAlarmLogUseCase) get(ctx context.Context, action string, id uint64) (res string, ok bool) {
+// read data from db and write to cache rp := &CameraAlarmLog{}
+item, err := uc.repo.Get(ctx, id)
+notFound	:=	errors.Is(err, reason.ErrorNotFound(i18n.FromContext(ctx).T(RecordNotFound)))
+if err != nil && !notFound { return
+}
+copierx.Copy(&rp, item) res = utils.Struct2Json(rp)
+uc.cache.Set(ctx, action, res, notFound) ok = true
+return
+}
+
+
+func	(uc	*CameraAlarmLogUseCase)	Find(ctx	context.Context,	condition
+*FindCameraAlarmLog) (rp []CameraAlarmLog) {
+// use md5 string as cache replay json str, key is short
+action := strings.Join([]string{"find", utils.StructMd5(condition)}, "_")
+str, ok := uc.cache.Get(ctx, action, func(ctx context.Context) (string, bool) { return uc.find(ctx, action, condition)
+})
+if ok {
+var cache FindCameraAlarmLogCache utils.Json2Struct(&cache, str) condition.Page = cache.Page
+
+rp = cache.List
+}
+for key, log := range rp {
+rp[key].TypeFormat = AlarmLogType(log.Type).String()
+}
+return
+}
+
+
+func (uc *CameraAlarmLogUseCase) find(ctx context.Context, action string, condition *FindCameraAlarmLog) (res string, ok bool) {
+// read data from db and write to cache list := uc.repo.Find(ctx, condition)
+var cache FindCameraAlarmLogCache cache.List = list
+cache.Page = condition.Page res = utils.Struct2Json(cache)
+uc.cache.Set(ctx, action, res, len(list) == 0) ok = true
+return
+}
+
+
+func	(uc	*CameraAlarmLogUseCase)	Update(ctx	context.Context,	item
+*UpdateCameraAlarmLog) error {
+return uc.tx.Tx(ctx, func(ctx context.Context) error {
+return uc.cache.Flush(ctx, func(ctx context.Context) (err error) { err = uc.repo.Update(ctx, item)
+return
+})
+})
+}
+
+
+
+func (uc *CameraAlarmLogUseCase) Delete(ctx context.Context, ids ...uint64) error { return uc.tx.Tx(ctx, func(ctx context.Context) error {
+return uc.cache.Flush(ctx, func(ctx context.Context) (err error) { err = uc.repo.Delete(ctx, ids...)
+return
+})
+})
+}
+
+
+// nolint: revive
+func (_ *CameraAlarmLogUseCase) GetLogType() ([]*LogType, error) { var logType []*LogType
+for i := 1; i <= CompressErr; i++ {
+logType = append(logType, &LogType{ Key:	uint32(i),
+Name: AlarmLogType(i).String(),
+})
+}
+return logType, nil
+}
+package biz
+
+
+import (
+"context" "errors" "strings"
+
+"codeup.aliyun.com/zenwell/go-common.git/copierx" "codeup.aliyun.com/zenwell/go-common.git/log"
+
+"video/api/video" "video/internal/conf" "video/internal/data/model"
+)
+
+
+type Token struct {
+URL	string	`json:"url"` JSONData *video.JsonData `json:"jsonData"`
+}
+
+
+type CommonRepo interface {
+GetToken(ctx context.Context, file string) (*Token, error) UploadParse(ctx context.Context, fileURL string) ([]*CreateCamera, error) GetTemplate(ctx context.Context, templateURL string) (string, error)
+}
+
+
+type CommonUseCase struct {
+c	*conf.Bootstrap
+repo	CommonRepo
+tx	Transaction
+cache	Cache cameraRepo		CameraRepo
+rtspStorage *RtspStorageUseCase
+}
+
+
+// nolint: revive
+func NewCommonUseCase(c *conf.Bootstrap, repo CommonRepo, tx Transaction, cache	Cache,	cameraRepo	CameraRepo,	rtspStorage	*RtspStorageUseCase)
+*CommonUseCase {
+return &CommonUseCase{
+
+c:	c,
+repo:		repo, cameraRepo: cameraRepo, tx:	tx,
+cache: cache.WithPrefix(strings.Join([]string{ c.Name, "common",
+}, "_")),
+rtspStorage: rtspStorage,
+}
+}
+
+
+func (uc *CommonUseCase) GetToken(ctx context.Context, file string) (*Token, error)
+{
+return uc.repo.GetToken(ctx, file)
+}
+
+
+func (uc *CommonUseCase) UploadParse(ctx context.Context, fileURL string) error {
+// download file
+// parse excel
+// get data save data
+cameraData, err := uc.repo.UploadParse(ctx, fileURL) if err != nil {
+return err
+}
+// check unique
+for k, camera := range cameraData {
+for k2, camera2 := range cameraData {
+if k != k2 && camera.Ip == camera2.Ip { return errors.New("IP 重复")
+}
+
+}
+}
+//check
+for _, camera := range cameraData {
+err := uc.cameraRepo.IpExists(ctx, camera.Ip) if err == nil {
+return errors.New("IP 重复")
+}
+}
+//
+err = uc.cameraRepo.CreateBatch(ctx, cameraData) if err != nil {
+return err
+}
+var cameras []*model.Camera
+for _, stream := range cameraData { var camera *model.Camera copierx.Copy(camera, stream)
+cameras = append(cameras, camera)
+}
+go uc.rtspStorage.serveStreams(ctx, cameras) return nil
+}
+
+
+func (uc *CommonUseCase) GetTemplate(ctx context.Context) (string, error) { templateURL,	err	:=	uc.repo.GetTemplate(ctx,
+uc.c.Data.Minio.GetCameraTemplate()) if err != nil {
+log.WithFields(log.Fields{ "templateUR": templateURL,
+
+}).Error(err) return "", err
+}
+return templateURL, nil
+}
+package biz
+
+
+import (
+"context" "strconv" "strings"
+
+"codeup.aliyun.com/zenwell/go-common.git/constant" "codeup.aliyun.com/zenwell/go-common.git/copierx" "codeup.aliyun.com/zenwell/go-common.git/middleware/i18n" "codeup.aliyun.com/zenwell/go-common.git/page" "codeup.aliyun.com/zenwell/go-common.git/utils" "github.com/pkg/errors"
+"video/api/reason" "video/internal/conf"
+)
+
+
+type HandleLog struct {
+Id	uint64 `json:"id,string"` UserId	 string `json:"userId,string"`
+UserName	 string `json:"userName,string"` Name	string `json:"name"`
+Type	 uint32 `json:"type"` Content	string `json:"content"`
+CreatedAt string `json:"createdAt,omitempty"`
+
+UpdatedAt string `json:"updatedAt,omitempty"`
+}
+
+
+type FindHandleLog struct {
+Page		 page.Page `json:"page"` Name				*string				 `json:"name"` UserID	*string		`json:"UserID"` Type		int32				`json:"type"` StartDate *string	`json:"startDate"` EndDate			*string			`json:"endDate"`
+}
+
+
+type FindHandleLogCache struct { Page page.Page	`json:"page"` List []HandleLog `json:"list"`
+}
+
+
+type UpdateHandleLog struct {
+Id	uint64	`json:"id,string"`
+Name *string `json:"name,omitempty"`
+}
+
+
+type CreateHandleLog struct {
+Id	uint64 `json:"id,string"` UserId	 string `json:"userId,string"`
+UserName string `json:"userName,string"` Name	string `json:"name"`
+Type	 uint32 `json:"type"` Content	string `json:"content"`
+}
+
+type HandLogType uint32
+
+
+const (
+LogTypeAdd = iota + 1 LogTypeDelete LogTypeEdit
+)
+
+
+func (t HandLogType) String() string { switch t {
+case LogTypeAdd: return "添加"
+case LogTypeDelete:
+return "删除" case LogTypeEdit:
+return "编辑"
+}
+return "unknown"
+}
+
+
+type HandleLogRepo interface {
+Create(ctx context.Context, item *CreateHandleLog) error Get(ctx context.Context, id uint64) (*HandleLog, error)
+Find(ctx context.Context, condition *FindHandleLog) []HandleLog Update(ctx context.Context, item *UpdateHandleLog) error Delete(ctx context.Context, ids ...uint64) error
+OperateLog(ctx context.Context, item interface{}, info *CreateHandleLog)
+}
+
+
+type HandleLogUseCase struct {
+
+c		*conf.Bootstrap repo		HandleLogRepo tx	Transaction cache Cache
+}
+
+
+func	NewHandleLogUseCase(c	*conf.Bootstrap,	repo	HandleLogRepo,	tx Transaction, cache Cache) *HandleLogUseCase {
+return &HandleLogUseCase{ c:	c,
+repo: repo, tx:	tx,
+cache: cache.WithPrefix(strings.Join([]string{ c.Name, "handle_log",
+}, "_")),
+}
+}
+
+
+func (uc *HandleLogUseCase) Create(ctx context.Context, item *CreateHandleLog) error {
+return uc.tx.Tx(ctx, func(ctx context.Context) error {
+return uc.cache.Flush(ctx, func(ctx context.Context) error { return uc.repo.Create(ctx, item)
+})
+})
+}
+
+
+func (uc *HandleLogUseCase) Get(ctx context.Context, id uint64) (rp *HandleLog, err error) {
+rp = &HandleLog{}
+
+action := strings.Join([]string{"get", strconv.FormatUint(id, 10)}, "_")
+str, ok := uc.cache.Get(ctx, action, func(ctx context.Context) (string, bool) { return uc.get(ctx, action, id)
+})
+if ok {
+utils.Json2Struct(&rp, str) if rp.Id == constant.UI0 {
+err	=	reason.ErrorNotFound("% s	HandleLog.id:	% d", i18n.FromContext(ctx).T(RecordNotFound), id)
+}
+return
+}
+err	=
+reason.ErrorTooManyRequests(i18n.FromContext(ctx).T(TooManyRequests)) return
+}
+
+
+func (uc *HandleLogUseCase) get(ctx context.Context, action string, id uint64) (res string, ok bool) {
+// read data from db and write to cache rp := &HandleLog{}
+item, err := uc.repo.Get(ctx, id)
+notFound	:=	errors.Is(err, reason.ErrorNotFound(i18n.FromContext(ctx).T(RecordNotFound)))
+if err != nil && !notFound { return
+}
+copierx.Copy(&rp, item) res = utils.Struct2Json(rp)
+uc.cache.Set(ctx, action, res, notFound)
+
+ok = true return
+}
+
+
+func (uc *HandleLogUseCase) Find(ctx context.Context, condition *FindHandleLog) (rp []HandleLog) {
+// use md5 string as cache replay json str, key is short
+action := strings.Join([]string{"find", utils.StructMd5(condition)}, "_")
+str, ok := uc.cache.Get(ctx, action, func(ctx context.Context) (string, bool) { return uc.find(ctx, action, condition)
+})
+if ok {
+var cache FindHandleLogCache utils.Json2Struct(&cache, str) condition.Page = cache.Page rp = cache.List
+}
+return
+}
+
+
+func (uc *HandleLogUseCase) find(ctx context.Context, action string, condition
+*FindHandleLog) (res string, ok bool) {
+// read data from db and write to cache list := uc.repo.Find(ctx, condition)
+var cache FindHandleLogCache cache.List = list
+cache.Page = condition.Page res = utils.Struct2Json(cache)
+uc.cache.Set(ctx, action, res, len(list) == 0) ok = true
+
+return
+}
+
+
+func (uc *HandleLogUseCase) Update(ctx context.Context, item *UpdateHandleLog) error {
+return uc.tx.Tx(ctx, func(ctx context.Context) error {
+return uc.cache.Flush(ctx, func(ctx context.Context) (err error) { err = uc.repo.Update(ctx, item)
+return
+})
+})
+}
+
+
+func (uc *HandleLogUseCase) Delete(ctx context.Context, ids ...uint64) error { return uc.tx.Tx(ctx, func(ctx context.Context) error {
+return uc.cache.Flush(ctx, func(ctx context.Context) (err error) { err = uc.repo.Delete(ctx, ids...)
+return
+})
+})
+}
+package biz
+
+
+import "github.com/pkg/errors"
+
+
+const (
+IdempotentMissingToken = "idempotent.token.missing"
+
+
+TooManyRequests = "too.many.requests" DataNotChange	= "data.not.change"
+
+DuplicateField	= "duplicate.field" RecordNotFound		= "record.not.found" NoPermission		= "no.permission"
+
+ErrorNoVideoErrStr		= "视频流缺失" ErrorInitConfigErrStr	= "stream init config err"
+ErrorInitClientErrStr	= "网络中断"
+ErrorStreamNoCodecStr			= "stream no codec" ErrorStreamSaveErrStr	= "stream minio save err" ErrorStreamStorageRecordErrStr = "stream minio save record err" ErrorVideoCompressErrStr		= "video compress err" ErrorVideoStopByDeletedStr	 = "video stop by deleted"
+)
+
+
+// Default stream errors var (
+ErrorNoVideoErr			= errors.New(ErrorNoVideoErrStr) ErrorInitConfigErr		= errors.New(ErrorInitConfigErrStr) ErrorInitClientErr	= errors.New(ErrorInitClientErrStr) ErrorStreamNoCodec					= errors.New(ErrorStreamNoCodecStr) ErrorStreamSaveErr			 = errors.New(ErrorStreamSaveErrStr) ErrorStreamStorageRecordErr = errors.New(ErrorStreamStorageRecordErrStr) ErrorVideoCompressErr				 = errors.New(ErrorVideoCompressErrStr) ErrorVideoStopByDeleted				= errors.New(ErrorVideoStopByDeletedStr)
+)
+package data
+
+
+import (
+"context" "errors"
+
+"math/rand" "strings" "time"
+
+"codeup.aliyun.com/zenwell/go-common.git/log" "codeup.aliyun.com/zenwell/go-common.git/plugins/gorm/tenant" "github.com/redis/go-redis/v9"
+"video/internal/biz"
+)
+
+
+// Cache .
+type Cache struct {
+redis	redis.UniversalClient prefix string
+lock	string
+val	string
+}
+
+
+// NewCache .
+func NewCache(client redis.UniversalClient) biz.Cache { return &Cache{
+redis:	client, prefix: "",
+lock:	"lock",
+val:	"val",
+}
+}
+
+
+func (c *Cache) Cache() redis.UniversalClient { return c.redis
+
+}
+
+
+func (c *Cache) WithPrefix(prefix string) biz.Cache { return &Cache{
+redis:	c.redis, prefix: prefix, lock:		c.lock,
+val:	c.val,
+}
+}
+
+
+func (c *Cache) Get(
+ctx context.Context, action string,
+write func(context.Context) (string, bool),
+) (res string, ok bool) {
+ctx = getDefaultTimeoutCtx(ctx) key := c.getValKey(ctx, action) var err error
+// 1. first get cache
+res, err = c.redis.Get(ctx, key).Result() if err == nil {
+// cache exists ok = true return
+}
+// 2. get lock before read db ok = c.Lock(ctx, action)
+if !ok {
+return
+
+}
+defer c.Unlock(ctx, action)
+// 3. double check cache exists(avoid concurrency step 1 ok=false) res, err = c.redis.Get(ctx, key).Result()
+if err == nil {
+// cache exists ok = true return
+}
+// 4. load data from db and write to cache if write != nil {
+res, ok = write(ctx)
+}
+return
+}
+
+
+func (c *Cache) Set(ctx context.Context, action, data string, short bool) { ctx = getDefaultTimeoutCtx(ctx)
+// set random expiration avoid a large number of keys expire at the same time seconds := rand.New(rand.NewSource(time.Now().Unix())).Int63n(300) + 300
+if short {
+// if record not found, set a short expiration seconds = 60
+}
+c.SetWithExpiration(ctx, action, data, seconds)
+}
+
+
+func (c *Cache) SetWithExpiration(ctx context.Context, action, data string, seconds int64) {
+ctx = getDefaultTimeoutCtx(ctx)
+
+// set random expiration avoid a large number of keys expire at the same time err	:=	c.redis.Set(ctx,	c.getValKey(ctx,	action),	data,
+time.Duration(seconds)*time.Second).Err() if err != nil {
+log.
+WithContext(ctx). WithError(err).
+WithFields(log.Fields{ "action":	action, "seconds": seconds,
+}).
+Warn("set cache failed") return
+}
+}
+
+
+func (c *Cache) Del(ctx context.Context, action string) { ctx = getDefaultTimeoutCtx(ctx)
+key := c.getValKey(ctx, action) err := c.redis.Del(ctx, key).Err() if err != nil {
+log.
+WithContext(ctx). WithError(err).
+WithFields(log.Fields{ "action": action, "key":	key,
+}).
+Warn("del cache failed")
+}
+
+}
+
+
+func (c *Cache) Flush(ctx context.Context, handler func(ctx context.Context) error) (err error) {
+err = handler(ctx) if err != nil {
+return
+}
+ctx = getDefaultTimeoutCtx(ctx) action := c.getPrefixKey(ctx)
+arr := c.redis.Keys(ctx, action).Val() p := c.redis.Pipeline()
+for _, item := range arr { if item == c.lock {
+continue
+}
+p.Del(ctx, item)
+}
+_, pErr := p.Exec(ctx) if pErr != nil {
+log.
+WithContext(ctx). WithError(pErr). WithFields(log.Fields{
+"action": action,
+
+
+
+
+
+
+}
+return
+}
+
+}).
+Warn("flush cache failed")
+
+
+
+func (c *Cache) Lock(ctx context.Context, action string) (ok bool) { retry := 0
+var e error
+for retry < 20 && !ok {
+ctx = getDefaultTimeoutCtx(ctx)
+ok,	e	=	c.redis.SetNX(ctx,	c.getLockKey(ctx,	action),	1, time.Minute).Result()
+if errors.Is(e, context.DeadlineExceeded) || errors.Is(e, context.Canceled) ||
+(e != nil && e.Error() == "redis: connection pool timeout") { log.
+WithContext(ctx). WithError(e).
+WithFields(log.Fields{ "action": action,
+}).
+Warn("lock failed") return
+}
+time.Sleep(25 * time.Millisecond) retry++
+}
+return
+}
+
+
+func (c *Cache) Unlock(ctx context.Context, action string) { ctx = getDefaultTimeoutCtx(ctx)
+err := c.redis.Del(ctx, c.getLockKey(ctx, action)).Err() if err != nil {
+
+log.
+WithContext(ctx). WithError(err).
+WithFields(log.Fields{ "action": action,
+}).
+Warn("unlock cache failed")
+}
+}
+
+
+func (c *Cache) getPrefixKey(ctx context.Context) string { id := tenant.FromContext(ctx)
+return strings.Join([]string{id, c.prefix, "*"}, "_")
+}
+
+
+func (c *Cache) getValKey(ctx context.Context, action string) string { id := tenant.FromContext(ctx)
+return strings.Join([]string{id, c.prefix, c.val, action}, "_")
+}
+
+
+func (c *Cache) getLockKey(ctx context.Context, action string) string { id := tenant.FromContext(ctx)
+return strings.Join([]string{id, c.prefix, c.lock, action}, "_")
+}
+package data
+
+
+import (
+"context" "fmt"
+"io"
+
+"time"
+
+
+zenwellminio "codeup.aliyun.com/zenwell/go-common.git/minio" "github.com/deepch/vdk/av"
+"github.com/minio/minio-go/v7" "github.com/pkg/errors" "video/internal/biz"
+)
+
+
+type rtspStorageRepo struct { data	*Data
+minio *zenwellminio.Minio
+}
+
+
+// Segment HLS cache section type Segment struct {
+dur	time.Duration data []*av.Packet
+}
+
+
+func	NewRtspStorageRepo(data	*Data,	minio	*zenwellminio.Minio) biz.RtspStorageRepo {
+return &rtspStorageRepo{ data:	data,
+minio: minio,
+}
+}
+
+
+func (r *rtspStorageRepo) StreamStorage(ctx context.Context, filePath string) (*minio.UploadInfo, error) {
+
+if filePath == "" {
+return nil, errors.New("empty filePath")
+}
+minioPath := fmt.Sprintf("video_storage/% s", filePath) info, err := r.minio.FPutObject(ctx, minioPath, filePath) if err != nil {
+return nil, err
+}
+return info, nil
+}
+
+
+func (r *rtspStorageRepo) StreamStorageByObj(ctx context.Context, filePath string, data io.Reader) (*minio.UploadInfo, error) {
+if filePath == "" {
+return nil, errors.New("empty filePath")
+}
+minioPath := fmt.Sprintf("video_storage/% s", filePath)
+info, err := r.minio.PutObject(ctx, minioPath, data, -1, minio.PutObjectOptions{}) if err != nil {
+return nil, err
+}
+return info, nil
+}
+package data
+
+
+import (
+"context" "strings"
+
+"codeup.aliyun.com/zenwell/go-common.git/constant"
+
+"codeup.aliyun.com/zenwell/go-common.git/copierx" "codeup.aliyun.com/zenwell/go-common.git/middleware/i18n" "codeup.aliyun.com/zenwell/go-common.git/utils" "github.com/golang-module/carbon/v2"
+"gorm.io/gen" "gorm.io/gen/field" "video/api/reason" "video/internal/biz" "video/internal/data/model" "video/internal/data/query"
+)
+
+
+type cameraAlarmLogRepo struct { data *Data
+}
+
+
+func NewCameraAlarmLogRepo(data *Data) biz.CameraAlarmLogRepo { return &cameraAlarmLogRepo{
+data: data,
+}
+}
+
+
+func	(ro	cameraAlarmLogRepo)	Create(ctx	context.Context,	item
+*biz.CreateCameraAlarmLog) (err error) { var m model.CameraAlarmLog copierx.Copy(&m, item)
+p := query.Use(ro.data.DB(ctx)).CameraAlarmLog db := p.WithContext(ctx)
+m.ID = ro.data.Id(ctx) err = db.Create(&m)
+
+return
+}
+
+
+func	(ro	cameraAlarmLogRepo)	Get(ctx	context.Context,	id	uint64)	(item
+*biz.CameraAlarmLog, err error) {
+item = &biz.CameraAlarmLog{}
+p := query.Use(ro.data.DB(ctx)).CameraAlarmLog db := p.WithContext(ctx)
+m := db.Preload(field.Associations).GetByID(id) if m.ID == constant.UI0 {
+err	=	reason.ErrorNotFound("% s	CameraAlarmLog.`id`:	% d", i18n.FromContext(ctx).T(biz.RecordNotFound), id)
+return
+}
+copierx.Copy(&item, m) return
+}
+
+
+func	(ro	cameraAlarmLogRepo)	Find(ctx	context.Context,	condition
+*biz.FindCameraAlarmLog) (rp []biz.CameraAlarmLog) {
+p := query.Use(ro.data.DB(ctx)).CameraAlarmLog db := p.WithContext(ctx)
+rp = make([]biz.CameraAlarmLog, 0)
+list := make([]model.CameraAlarmLog, 0) conditions := make([]gen.Condition, 0, 4)
+
+if condition.CameraId != nil {
+conditions = append(conditions, p.CameraID.Eq(*condition.CameraId))
+}
+
+if condition.Type != 0 {
+conditions = append(conditions, p.Type.Eq(condition.Type))
+}
+
+
+if condition.StartDate != nil {
+conditions	=	append(conditions, p.CreatedAt.Gte(carbon.Parse(*condition.StartDate)))
+}
+//
+if condition.EndDate != nil {
+conditions	=	append(conditions, p.CreatedAt.Lt(carbon.Parse(*condition.EndDate)))
+}
+conditions = append(conditions, p.Type.In(1, 2)) condition.Page.Primary = "id"
+condition.Page.
+WithContext(ctx). Query(
+db.
+Preload(field.Associations). Order(p.ID.Desc()).
+Where(conditions...). UnderlyingDB().
+Model(&model.CameraAlarmLog{}),
+).
+Find(&list) copierx.Copy(&rp, list) return
+}
+
+func	(ro	cameraAlarmLogRepo)	Update(ctx	context.Context,	item
+*biz.UpdateCameraAlarmLog) (err error) {
+p := query.Use(ro.data.DB(ctx)).CameraAlarmLog db := p.WithContext(ctx)
+m := db.GetByID(item.Id) if m.ID == constant.UI0 {
+err	=	reason.ErrorNotFound("% s	CameraAlarmLog.`id`:	% d", i18n.FromContext(ctx).T(biz.RecordNotFound), item.Id)
+return
+}
+change := make(map[string]interface{}) utils.CompareDiff(m, item, &change)
+if len(change) == 0 {
+err	=
+reason.ErrorIllegalParameter(i18n.FromContext(ctx).T(biz.DataNotChange)) return
+}
+if item.Name != nil && *item.Name != m.Name { err = ro.NameExists(ctx, *item.Name)
+if err == nil {
+err	=	reason.ErrorIllegalParameter("% s	`name`:	% s", i18n.FromContext(ctx).T(biz.DuplicateField), *item.Name)
+return
+}
+}
+_, err = db.
+Where(p.ID.Eq(item.Id)). Updates(&change)
+return
+}
+
+
+
+func (ro cameraAlarmLogRepo) Delete(ctx context.Context, ids ...uint64) (err error) { p := query.Use(ro.data.DB(ctx)).CameraAlarmLog
+db := p.WithContext(ctx)
+_, err = db.
+Where(p.ID.In(ids...)). Delete()
+return
+}
+
+
+func (ro cameraAlarmLogRepo) NameExists(ctx context.Context, name string) (err error) {
+p := query.Use(ro.data.DB(ctx)).CameraAlarmLog db := p.WithContext(ctx)
+arr := strings.Split(name, ",") for _, item := range arr {
+res := db.GetByCol("name", item) if res.ID == constant.UI0 {
+err	=	reason.ErrorNotFound("% s	CameraAlarmLog.`name`:	% s", i18n.FromContext(ctx).T(biz.RecordNotFound), item)
+return
+}
+}
+return
+}
+package data
+
+
+import (
+"context" "fmt"
+
+"strings"
+
+
+"codeup.aliyun.com/zenwell/go-common.git/constant" "codeup.aliyun.com/zenwell/go-common.git/copierx" "codeup.aliyun.com/zenwell/go-common.git/log" "codeup.aliyun.com/zenwell/go-common.git/middleware/i18n" "codeup.aliyun.com/zenwell/go-common.git/utils" "gorm.io/gen"
+"video/api/reason" "video/internal/biz" "video/internal/data/model" "video/internal/data/query"
+)
+
+
+type cameraRepo struct { data *Data
+}
+
+
+func NewCameraRepo(data *Data) biz.CameraRepo { return &cameraRepo{
+data: data,
+}
+}
+
+
+func (ro cameraRepo) Create(ctx context.Context, item *biz.CreateCamera) (err error)
+{
+err = ro.IpExists(ctx, item.Ip) if err == nil {
+err	=	reason.ErrorIllegalParameter("% s	`ip`:	% s",
+i18n.FromContext(ctx).T(biz.DuplicateField), item.Ip)
+
+return
+}
+var m model.Camera
+
+
+item.Id = ro.data.Id(ctx) copierx.Copy(&m, item)
+p := query.Use(ro.data.DB(ctx)).Camera db := p.WithContext(ctx)
+err = db.Create(&m) return
+}
+
+
+func (ro cameraRepo) Get(ctx context.Context, id uint64) (item *biz.Camera, err error)
+{
+item = &biz.Camera{}
+p := query.Use(ro.data.DB(ctx)).Camera db := p.WithContext(ctx)
+m := db.GetByID(id)
+if m.ID == constant.UI0 {
+err	=	reason.ErrorNotFound("% s	Camera.`id`:	% d",
+i18n.FromContext(ctx).T(biz.RecordNotFound), id) return
+}
+copierx.Copy(&item, m) return
+}
+
+
+func (ro cameraRepo) GetByFields(ctx context.Context, no string) (item *biz.Camera, err error) {
+item = &biz.Camera{}
+
+p := query.Use(ro.data.DB(ctx)).Camera db := p.WithContext(ctx)
+m, err := db.Where(p.No.Eq(no)).First() if err != nil {
+return nil, err
+}
+err = copierx.Copy(item, m) if err != nil {
+return nil, err
+}
+return
+}
+
+
+func (ro cameraRepo) Find(ctx context.Context, condition *biz.FindCamera) (rp []biz.Camera) {
+p := query.Use(ro.data.DB(ctx)).Camera db := p.WithContext(ctx)
+rp = make([]biz.Camera, 0)
+list := make([]model.Camera, 0) conditions := make([]gen.Condition, 0, 5) if condition.Ip != nil {
+conditions	=	append(conditions,	p.IP.Like(strings.Join([]string{"%",
+*condition.Ip, "%"}, "")))
+}
+if condition.Status != nil {
+conditions = append(conditions, p.Status.Eq(*condition.Status))
+}
+if condition.NetStatus != nil {
+conditions = append(conditions, p.NetStatus.Eq(*condition.NetStatus))
+}
+
+if condition.Position != nil {
+conditions = append(conditions, p.Position.Eq(*condition.Position))
+}
+if condition.No != nil {
+conditions = append(conditions, p.No.Eq(*condition.No))
+}
+condition.Page.Primary = "id" condition.Page.
+WithContext(ctx). Query(
+db.Debug().
+Order(p.ID.Desc()). Where(conditions...). UnderlyingDB(),
+).
+Find(&list) copierx.Copy(&rp, list) return
+}
+
+
+func (ro cameraRepo) Update(ctx context.Context, item *biz.UpdateCamera) (err error) {
+p := query.Use(ro.data.DB(ctx)).Camera db := p.WithContext(ctx)
+m := db.GetByID(item.Id) if m.ID == constant.UI0 {
+err	=	reason.ErrorNotFound("% s	Camera.`id`:	% d", i18n.FromContext(ctx).T(biz.RecordNotFound), item.Id)
+return
+}
+
+change := make(map[string]interface{}) utils.CompareDiff(m, item, &change)
+if len(change) == 0 {
+err	=
+reason.ErrorIllegalParameter(i18n.FromContext(ctx).T(biz.DataNotChange)) return
+}
+log.Info(fmt.Sprintf("change---% +v", change))
+_, err = db.
+Where(p.ID.Eq(item.Id)). Updates(&change)
+return
+}
+
+
+func (ro cameraRepo) Delete(ctx context.Context, ids ...uint64) (err error) { p := query.Use(ro.data.DB(ctx)).Camera
+db := p.WithContext(ctx)
+_, err = db.
+Where(p.ID.In(ids...)). Delete()
+return
+}
+
+
+func (ro cameraRepo) IpExists(ctx context.Context, name string) (err error) { p := query.Use(ro.data.DB(ctx)).Camera
+db := p.WithContext(ctx)
+arr := strings.Split(name, ",") for _, item := range arr {
+res := db.GetByCol("ip", item) if res.ID == constant.UI0 {
+
+err	=	reason.ErrorNotFound("% s	Camera.`ip`:	% s", i18n.FromContext(ctx).T(biz.RecordNotFound), item)
+return
+}
+}
+return
+}
+
+
+func	(ro	cameraRepo)	CreateBatch(ctx	context.Context,	cameras []*biz.CreateCamera) (err error) {
+var m []*model.Camera
+
+
+for _, camera := range cameras { camera.Id = ro.data.Id(ctx)
+}
+
+
+copierx.Copy(&m, cameras)
+p := query.Use(ro.data.DB(ctx)).Camera db := p.WithContext(ctx)
+
+err = db.CreateInBatches(m, 1000) return
+}
+
+
+func (ro cameraRepo) All(ctx context.Context, request *biz.FindCamera) (camera []*model.Camera, err error) {
+p := query.Use(ro.data.DB(ctx)).Camera db := p.WithContext(ctx) fmt.Printf("% +v", request)
+conditions := make([]gen.Condition, 0, 1)
+
+if request.Status != nil {
+conditions = append(conditions, p.Status.Eq(*request.Status))
+}
+camera,	err	=	db.Select(p.ID,	p.No,	p.IP,	p.Position,	p.Status, p.CreatedAt).Where(conditions...).Find()
+if err != nil {
+return nil, err
+}
+return
+}
+
+
+func (ro cameraRepo) GetMinoURL(ctx context.Context, path string) (string, error) {
+//templateUrl := ctx.Value()
+info, err := ro.data.minio.FPutObject(ctx, "templateURL", path) if err != nil {
+return "", err
+}
+url, err := ro.data.minio.Preview(ctx, info.Key) if err != nil {
+return "", err
+}
+return url, nil
+}
+package data
+
+
+import (
+"context" "fmt"
+
+"codeup.aliyun.com/zenwell/go-common.git/log"
+
+"github.com/xuri/excelize/v2" "video/api/video" "video/internal/biz"
+)
+
+
+type commonRepo struct { data *Data
+}
+
+
+func (ro commonRepo) GetTemplate(ctx context.Context, templateURL string) (string, error) {
+//templateUrl := ctx.Value()
+url, err := ro.data.minio.Preview(ctx, templateURL) fmt.Println("log---GetTemplate", url)
+return url, err
+}
+
+
+func	(ro	commonRepo)	UploadParse(ctx	context.Context,	fileURL	string) ([]*biz.CreateCamera, error) {
+fileTmp, _ := ro.data.minio.Get(ctx, fileURL)
+
+
+var cameraData []*biz.CreateCamera file, err := excelize.OpenFile(fileTmp) if err != nil {
+log.WithFields(log.Fields{ "fileUrl": fileURL, "fileTmp": fileTmp,
+})
+return nil, err
+}
+
+
+
+rows, err := file.GetRows("Sheet1") if err != nil {
+fmt.Println(err) return nil, err
+}
+for key, row := range rows { if key == 0 {
+continue
+}
+cameraTmp := &biz.CreateCamera{} for rowKey, col := range row {
+switch rowKey { case 0:
+cameraTmp.No = col case 1:
+cameraTmp.Ip = col case 2:
+cameraTmp.Position = col
+}
+}
+cameraData = append(cameraData, cameraTmp)
+}
+return cameraData, nil
+}
+
+
+func NewCommonRepo(data *Data) biz.CommonRepo { return &commonRepo{
+data: data,
+}
+
+}
+
+
+func (ro commonRepo) GetToken(ctx context.Context, file string) (*biz.Token, error) { token := &biz.Token{}
+tokenObj, _ := ro.data.minio.Token(ctx, file) token.URL = tokenObj.Uri token.JSONData = &video.JsonData{
+ContentType:	 tokenObj.Data["Content-Type"], Bucket:	tokenObj.Data["bucket"],
+Key:	tokenObj.Data["key"],
+Policy:	tokenObj.Data["policy"], XAmzAlgorithm:	 tokenObj.Data["x-amz-algorithm"], XAmzCredential: tokenObj.Data["x-amz-credential"], XAmzDate:			tokenObj.Data["x-amz-date"], XAmzSignature:	tokenObj.Data["x-amz-signature"],
+}
+return token, nil
+}
+package service
+
+
+import (
+"context" "fmt"
+
+"codeup.aliyun.com/zenwell/go-common.git/copierx" "codeup.aliyun.com/zenwell/go-common.git/log" "codeup.aliyun.com/zenwell/go-common.git/page" "codeup.aliyun.com/zenwell/go-common.git/proto/params" "codeup.aliyun.com/zenwell/go-common.git/utils" "go.opentelemetry.io/otel"
+
+"google.golang.org/protobuf/types/known/emptypb" "video/api/video"
+"video/internal/biz"
+)
+
+
+func	(s	*VideoService)	CreateCamera(ctx	context.Context,	req
+*video.CreateCameraRequest) (rp *emptypb.Empty, err error) { tr := otel.Tracer("api")
+ctx, span := tr.Start(ctx, "CreateCamera") defer span.End()
+rp = &emptypb.Empty{} r := &biz.CreateCamera{} copierx.Copy(&r, req)
+log.Info(fmt.Sprintf("% +v", req)) err = s.camera.Create(ctx, r) return
+}
+
+
+func	(s	*VideoService)	GetCamera(ctx	context.Context,	req
+*video.GetCameraRequest) (rp *video.GetCameraReply, err error) { tr := otel.Tracer("api")
+ctx, span := tr.Start(ctx, "GetCamera") defer span.End()
+rp = &video.GetCameraReply{} res, err := s.camera.Get(ctx, req.Id) if err != nil {
+return
+}
+copierx.Copy(&rp, res) return
+
+}
+
+
+func	(s	*VideoService)	FindCamera(ctx	context.Context,	req
+*video.FindCameraRequest) (rp *video.FindCameraReply, err error) { tr := otel.Tracer("api")
+ctx, span := tr.Start(ctx, "FindCamera") defer span.End()
+rp = &video.FindCameraReply{} rp.Page = &params.Page{}
+r := &biz.FindCamera{} r.Page = page.Page{} copierx.Copy(&r, req)
+copierx.Copy(&r.Page, req.Page) res := s.camera.Find(ctx, r) copierx.Copy(&rp.Page, r.Page) copierx.Copy(&rp.List, res) return
+}
+
+
+func	(s	*VideoService)	UpdateCamera(ctx	context.Context,	req
+*video.UpdateCameraRequest) (rp *emptypb.Empty, err error) { tr := otel.Tracer("api")
+ctx, span := tr.Start(ctx, "UpdateCamera") defer span.End()
+rp = &emptypb.Empty{}
+r := &biz.UpdateCamera{} copierx.Copy(&r, req)
+err = s.camera.Update(ctx, r) return
+}
+
+
+
+func (s *VideoService) DeleteCamera(ctx context.Context, req *params.IdsRequest) (rp *emptypb.Empty, err error) {
+tr := otel.Tracer("api")
+ctx, span := tr.Start(ctx, "DeleteCamera") defer span.End()
+rp = &emptypb.Empty{}
+err = s.camera.Delete(ctx, utils.Str2Uint64Arr(req.Ids)...) return
+}
+
+
+func	(s	*VideoService)	ExportCamera(ctx	context.Context,	request
+*video.ExportCameraRequest) (*video.DownloadFileResp, error) { tr := otel.Tracer("api")
+ctx, span := tr.Start(ctx, "ExportCamera") defer span.End()
+
+url, err := s.camera.ExportAll(ctx, request) if err != nil {
+return nil, err
+}
+return &video.DownloadFileResp{ Url: url,
+}, nil
+}
+package service
+
+
+import (
+"context"
+
+"codeup.aliyun.com/zenwell/go-common.git/copierx" "codeup.aliyun.com/zenwell/go-common.git/page" "codeup.aliyun.com/zenwell/go-common.git/proto/params" "codeup.aliyun.com/zenwell/go-common.git/utils" "go.opentelemetry.io/otel" "google.golang.org/protobuf/types/known/emptypb" "video/api/video"
+"video/internal/biz"
+)
+
+
+func	(s	*VideoService)	GetCameraAlarmLog(ctx	context.Context,	req
+*video.GetCameraAlarmLogRequest) (rp *video.GetCameraAlarmLogReply, err error) { tr := otel.Tracer("api")
+ctx, span := tr.Start(ctx, "GetCameraAlarmLog") defer span.End()
+rp = &video.GetCameraAlarmLogReply{} res, err := s.cameraAlarmLog.Get(ctx, req.Id) if err != nil {
+return
+}
+copierx.Copy(&rp, res) return
+}
+
+
+func	(s	*VideoService)	FindCameraAlarmLog(ctx	context.Context,	req
+*video.FindCameraAlarmLogRequest) (rp *video.FindCameraAlarmLogReply, err error) { tr := otel.Tracer("api")
+ctx, span := tr.Start(ctx, "FindCameraAlarmLog") defer span.End()
+rp = &video.FindCameraAlarmLogReply{}
+
+rp.Page = &params.Page{}
+r := &biz.FindCameraAlarmLog{} r.Page = page.Page{} copierx.Copy(&r, req) copierx.Copy(&r.Page, req.Page) res := s.cameraAlarmLog.Find(ctx, r) copierx.Copy(&rp.Page, r.Page) copierx.Copy(&rp.List, res)
+return
+}
+
+
+func	(s	*VideoService)	DeleteCameraAlarmLog(ctx	context.Context,	req
+*params.IdsRequest) (rp *emptypb.Empty, err error) { tr := otel.Tracer("api")
+ctx, span := tr.Start(ctx, "DeleteCameraAlarmLog") defer span.End()
+rp = &emptypb.Empty{}
+err = s.cameraAlarmLog.Delete(ctx, utils.Str2Uint64Arr(req.Ids)...) return
+}
+
+
+func (s *VideoService) GetCameraAlarmLogType(ctx context.Context,
+_	*video.GetCameraAlarmLogTypeRequest)	(rp
+*video.GetCameraAlarmLogTypeReply, err error) { tr := otel.Tracer("api")
+ctx, span := tr.Start(ctx, "GetCameraAlarmLogType") defer span.End()
+rp = &video.GetCameraAlarmLogTypeReply{} list, err := s.cameraAlarmLog.GetLogType() err = copierx.Copy(&rp.List, list)
+
+if err != nil {
+return nil, err
+}
+return
+}
+package service
+
+
+import (
+"context"
+
+
+"codeup.aliyun.com/zenwell/go-common.git/copierx" "go.opentelemetry.io/otel" "google.golang.org/protobuf/types/known/emptypb" "video/api/video"
+)
+
+
+func (s *VideoService) GetToken(ctx context.Context, req *video.TokenRequest) (rp
+*video.TokenReply, err error) { tr := otel.Tracer("api")
+ctx, span := tr.Start(ctx, "getToken") defer span.End()
+rp = &video.TokenReply{}
+
+
+res, err := s.common.GetToken(ctx, req.FileName) if err != nil {
+return
+}
+copierx.Copy(&rp, res) return
+}
+
+
+
+func (s *VideoService) UploadParse(ctx context.Context, req *video.ParseRequest) (reply *emptypb.Empty, err error) {
+tr := otel.Tracer("api")
+ctx, span := tr.Start(ctx, "CameraParse") defer span.End()
+err = s.common.UploadParse(ctx, req.FileUrl) if err != nil {
+return
+}
+err = s.camera.FlushAll(ctx) if err != nil {
+return
+}
+return
+}
+
+
+func (s *VideoService) GetTemplate(ctx context.Context, _ *emptypb.Empty) (reply
+*video.TemplateReply, err error) { tr := otel.Tracer("api")
+ctx, span := tr.Start(ctx, "CameraParse") defer span.End()
+
+reply = &video.TemplateReply{}
+
+
+templateURL, err := s.common.GetTemplate(ctx) if err != nil {
+return
+}
+reply.Url = templateURL
+
+return
+}
+package service
+
+
+import (
+"context" "errors" "net/http" "strconv" "strings"
+
+"codeup.aliyun.com/zenwell/go-common.git/copierx" "codeup.aliyun.com/zenwell/go-common.git/log" "github.com/gorilla/websocket" "go.opentelemetry.io/otel"
+"video/api/video" "video/internal/biz"
+)
+
+
+var upgrader = websocket.Upgrader{ CheckOrigin: func(r *http.Request) bool {
+return true
+},
+}
+
+
+func	(s	*VideoService)	CreateRtspStream(ctx	context.Context,	req
+*video.CreateRtspStreamRequest) (rp *video.CreateRtspStreamReply, err error) { tr := otel.Tracer("api")
+ctx, span := tr.Start(ctx, "CreateRtspStream") defer span.End()
+
+rp = &video.CreateRtspStreamReply{} r := &biz.CreateRtspStream{} copierx.Copy(&r, req)
+res, err := s.rtsp.CreateStream(ctx, r) if err != nil {
+return
+}
+copierx.Copy(&rp, res) return
+}
+
+
+func (s *VideoService) RtspMSE(writer http.ResponseWriter, req *http.Request) { conn, err := upgrader.Upgrade(writer, req, nil)
+if err != nil {
+msg := strings.Join([]string{"create ws failed: ", err.Error()}, "") log.WithError(err).Warn(msg)
+return
+}
+defer conn.Close()
+log.WithField("socket-id", req.Header.Get("Sec-WebSocket-Key")).Info("create ws success")
+//
+ctx := req.Context()
+id := req.URL.Query().Get("id")
+no := req.URL.Query().Get("no")
+idInt, err := strconv.ParseInt(id, 10, 64) if idInt <= 0 && no == "" {
+err = errors.New("未传入 ID 或者 NO")
+return
+}
+
+var camera *biz.Camera if idInt > 0 {
+camera, err = s.camera.Get(ctx, uint64(idInt))
+} else {
+camera, err = s.camera.GetByFields(ctx, no)
+}
+if err != nil {
+log.Info("get camera err", err) return
+}
+
+
+r := &biz.CreateRtspMSE{ Conn: conn,
+Uri:	camera.Ip,
+}
+err = s.rtsp.CreateMSE(req.Context(), r) if err != nil {
